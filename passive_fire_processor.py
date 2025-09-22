@@ -1,4 +1,4 @@
-# passive_fire_processor.py
+# passive_fire_processor_v4.0.py - Fixed Service & FRR Logic
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,10 +8,12 @@ import json
 from datetime import datetime
 import io
 import base64
+from typing import List, Dict, Tuple, Optional, Union
+from difflib import SequenceMatcher
 
 # Set page configuration
 st.set_page_config(
-    page_title="Passive Fire Schedule Processor v3.0",
+    page_title="Passive Fire Schedule Processor v4.0",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -74,64 +76,378 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================
-# Normalization & Variant Engine
+# ENHANCED DATA STRUCTURES & CONFIG
+# ============================
+
+class ColumnMapping:
+    """Configurable column mapping for different data sources"""
+    
+    # STANDARDIZED CSV Column Names (these will be the target names after renaming)
+    # The order/sequence corresponds to expected column positions 0-12
+    csv_standardized_columns = [
+        'Item_Name',                    # Position 0
+        'Item_Type',                    # Position 1  
+        'Element_ID',                   # Position 2
+        'Fire_Rating_FRR',              # Position 3
+        'Wall_System',                  # Position 4
+        'Wall_Framing',                 # Position 5
+        'Wall_Lining',                  # Position 6
+        'Insulation_Thickness_mm',      # Position 7
+        'Geometry_Size',                # Position 8
+        'System_Classification',        # Position 9
+        'Mechanical_Material',          # Position 10
+        'Structural_Material',          # Position 11
+        'Insulation_Type'               # Position 12
+    ]
+    
+    # After standardization, these are the column names we'll use throughout the script
+    csv_item_name: str = 'Item_Name'
+    csv_item_type: str = 'Item_Type' 
+    csv_id_column: str = 'Element_ID'
+    csv_frr: str = 'Fire_Rating_FRR'
+    csv_wall_system: str = 'Wall_System'
+    csv_wall_framing: str = 'Wall_Framing'
+    csv_wall_lining: str = 'Wall_Lining'
+    csv_insulation_thickness: str = 'Insulation_Thickness_mm'
+    csv_size: str = 'Geometry_Size'
+    csv_system_classification: str = 'System_Classification'
+    csv_mechanical_material: str = 'Mechanical_Material'
+    csv_structural_material: str = 'Structural_Material'
+    csv_insulation_type: str = 'Insulation_Type'
+    
+    # Size Lookup Table Columns
+    size_lookup_name_cols: List[str] = ['Steel Name', 'Name', 'Steel', 'Item Name']
+    size_lookup_width_cols: List[str] = ['Overall Width', 'Width', 'width']
+    size_lookup_height_cols: List[str] = ['Overall Height', 'Height', 'height']
+    size_lookup_material_cols: List[str] = ['Materials', 'Material', 'Type']
+    
+    # Materials Lookup Table Columns  
+    materials_lookup_source_cols: List[str] = ['Material Name', 'Source Material', 'Original', 'Input']
+    materials_lookup_target_cols: List[str] = ['Materials', 'Mapped Material', 'Target Material', 'Output', 'Standard Material']
+
+# Global column mapping configuration
+COLUMN_MAPPING = ColumnMapping()
+
+# ============================
+# SIMPLIFIED DATA RETRIEVAL ENGINE
+# ============================
+
+def similarity_score(a: str, b: str) -> float:
+    """Calculate similarity score between two strings (0.0 to 1.0)"""
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+def unified_data_retrieval(
+    data_source: pd.DataFrame,
+    element_ids: List[Union[int, str]],
+    string_identifiers: List[str],
+    target_columns: List[str],
+    id_column: str,
+    confidence_threshold: float = 0.75,
+    enable_string_fallback: bool = True
+) -> str:
+    """
+    Simplified data retrieval engine - returns value directly
+    """
+    if data_source is None or data_source.empty:
+        return ''
+    
+    # Phase 1: Try exact ID matches
+    if element_ids and id_column in data_source.columns:
+        for element_id in element_ids:
+            try:
+                if isinstance(element_id, (int, float)) and not pd.isna(element_id):
+                    matches = data_source[data_source[id_column] == element_id]
+                elif isinstance(element_id, str) and element_id.strip():
+                    # Try both exact match and contains for string IDs
+                    exact_matches = data_source[data_source[id_column].astype(str) == str(element_id)]
+                    if not exact_matches.empty:
+                        matches = exact_matches
+                    else:
+                        matches = data_source[data_source[id_column].astype(str).str.contains(str(element_id), case=False, na=False)]
+                else:
+                    continue
+                    
+                if not matches.empty:
+                    match_row = matches.iloc[0]
+                    # Try each target column in order
+                    for col in target_columns:
+                        if col in match_row.index and pd.notna(match_row[col]) and str(match_row[col]).strip():
+                            return str(match_row[col]).strip()
+            except Exception:
+                continue
+    
+    # Phase 2: Try string identifier exact matches
+    if enable_string_fallback and string_identifiers:
+        search_columns = [col for col in [COLUMN_MAPPING.csv_item_type, COLUMN_MAPPING.csv_item_name] 
+                         if col in data_source.columns]
+        
+        for identifier in string_identifiers:
+            if not identifier or not identifier.strip():
+                continue
+                
+            identifier = identifier.strip()
+            
+            for search_col in search_columns:
+                # Exact string matches
+                exact_matches = data_source[
+                    data_source[search_col].astype(str).str.contains(
+                        re.escape(identifier), case=False, na=False, regex=True
+                    )
+                ]
+                
+                for _, match_row in exact_matches.iterrows():
+                    # Calculate confidence based on string similarity
+                    search_value = str(match_row[search_col]).strip()
+                    conf = similarity_score(identifier, search_value)
+                    
+                    if conf >= confidence_threshold:
+                        # Try each target column
+                        for col in target_columns:
+                            if col in match_row.index and pd.notna(match_row[col]) and str(match_row[col]).strip():
+                                return str(match_row[col]).strip()
+    
+    return ''
+
+# ============================
+# ENHANCED CSV COLUMN STANDARDIZATION
+# ============================
+
+def standardize_csv_columns_by_position(df):
+    """
+    ENHANCED: Standardize CSV column names by position regardless of original names
+    This ensures consistent column names across different projects
+    """
+    if df is None or df.empty:
+        return df
+    
+    # Create a mapping from current position to standardized name
+    column_mapping = {}
+    standardized_df = df.copy()
+    
+    # Map columns by position to standardized names
+    num_cols_to_rename = min(len(df.columns), len(COLUMN_MAPPING.csv_standardized_columns))
+    
+    for i in range(num_cols_to_rename):
+        original_name = df.columns[i]
+        standardized_name = COLUMN_MAPPING.csv_standardized_columns[i]
+        column_mapping[original_name] = standardized_name
+    
+    # Apply the renaming
+    standardized_df = standardized_df.rename(columns=column_mapping)
+    
+    # Report the standardization
+    st.success(f"✅ CSV columns standardized by position! Renamed {len(column_mapping)} columns.")
+    
+    with st.expander("📊 Column Standardization Report", expanded=False):
+        st.write("**Position-Based Column Mapping Applied:**")
+        for i, (original, standardized) in enumerate(column_mapping.items()):
+            st.write(f"Position {i}: `{original}` → `{standardized}`")
+        
+        if len(df.columns) > len(COLUMN_MAPPING.csv_standardized_columns):
+            st.warning(f"⚠️ Found {len(df.columns) - len(COLUMN_MAPPING.csv_standardized_columns)} extra columns beyond position 12. These will be preserved with original names.")
+        
+        st.info("💡 This position-based mapping ensures the script works with different column naming conventions across projects.")
+    
+    return standardized_df
+
+# ============================
+# ENHANCED ELEMENT ID EXTRACTION
+# ============================
+
+def extract_element_ids(title, debug=False):
+    """
+    Enhanced element ID extraction with support for both numeric and string identifiers
+    """
+    if pd.isna(title) or not title:
+        return []
+
+    element_ids = []
+    string_identifiers = []
+    
+    try:
+        if debug: 
+            st.write(f"DEBUG: Processing title: {title}")
+        
+        # Split by "|" and check each part for element IDs
+        parts = title.split('|')
+        
+        for i, part in enumerate(parts):
+            # Look for numeric IDs (6+ digits)
+            id_matches = re.findall(r'-\s*(\d{6,})(?:\s*\||$)', part)
+            element_ids.extend([int(match) for match in id_matches])
+            
+            # Also check for IDs before brackets
+            bracket_matches = re.findall(r'(\d{6,})\s*\[', part)
+            element_ids.extend([int(match) for match in bracket_matches])
+            
+            # Extract string identifiers for fallback - ENHANCED for steel names
+            # Look for steel/structural patterns in the part
+            steel_patterns = [
+                r'\b(\d+\s*(?:UB|UC)\s*\d*)\b',      # 410UB60, 360UB57
+                r'\b(\d+\s*DHS(?:\s*Purlin)?)\b',    # 200 DHS, 200 DHS Purlin  
+                r'\b(\d+x\d+x\d+\s*(?:SHS|RHS))\b', # Structural sections
+                r'\b(\d+x\d+\s*(?:SHS|RHS))\b',     # Square/rectangular sections
+            ]
+            
+            for pattern in steel_patterns:
+                matches = re.findall(pattern, part, re.IGNORECASE)
+                for match in matches:
+                    clean_match = re.sub(r'\s+', ' ', match.strip())
+                    if clean_match and len(clean_match) > 2:
+                        string_identifiers.append(clean_match)
+            
+            # Also extract general meaningful descriptive parts
+            string_match = re.search(r'-\s*([^-\|]+?)\s*-\s*\d{6,}', part)
+            if string_match:
+                string_id = string_match.group(1).strip()
+                if string_id and len(string_id) > 3 and not re.match(r'^\d+$', string_id):
+                    # Don't add if it's already a steel pattern we caught above
+                    if not any(steel_pattern in string_id.upper() for steel_pattern in ['UB', 'UC', 'DHS', 'SHS', 'RHS']):
+                        string_identifiers.append(string_id)
+            
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_ids = []
+        for id_val in element_ids:
+            if id_val not in seen:
+                seen.add(id_val)
+                unique_ids.append(id_val)
+        
+        seen_strings = set()
+        unique_strings = []
+        for string_id in string_identifiers:
+            string_clean = string_id.strip()
+            if string_clean.upper() not in seen_strings and len(string_clean) > 2:
+                seen_strings.add(string_clean.upper())
+                unique_strings.append(string_clean)
+        
+        # Combine numeric IDs (priority) with string identifiers
+        all_identifiers = unique_ids + unique_strings
+        
+        if debug:
+            st.write(f"DEBUG: Found numeric IDs: {unique_ids}")
+            st.write(f"DEBUG: Found string identifiers: {unique_strings}")
+            
+        return all_identifiers
+        
+    except Exception as e:
+        if debug:
+            st.write(f"DEBUG: Exception: {e}")
+        return []
+
+# ============================
+# ENHANCED SIZE EXTRACTION WITH RECTANGULAR PRESERVATION
+# ============================
+
+def extract_largest_pipe_size(size_text):
+    """
+    FIXED: Enhanced size extraction that preserves rectangular dimensions
+    """
+    if not size_text or pd.isna(size_text):
+        return ''
+
+    size_str = str(size_text).strip()
+    
+    # First check for rectangular dimensions (preserve as-is)
+    rect_patterns = [
+        r'(\d+\s*x\s*\d+)(?:\s*mm)?',  # 450x450, 762x170
+        r'(\d+\s*×\s*\d+)(?:\s*mm)?'   # Alternative multiplication symbol
+    ]
+    
+    for pattern in rect_patterns:
+        rect_matches = re.findall(pattern, size_str, re.IGNORECASE)
+        if rect_matches:
+            # Return the largest rectangular dimension (by area)
+            max_area = 0
+            max_rect = ''
+            
+            for rect in rect_matches:
+                dims = re.findall(r'\d+', rect)
+                if len(dims) >= 2:
+                    area = int(dims[0]) * int(dims[1])
+                    if area > max_area:
+                        max_area = area
+                        max_rect = f"{dims[0]}x{dims[1]}"
+            
+            if max_rect:
+                return max_rect
+    
+    # If no rectangular dimensions, handle as before but with improved logic
+    # Split by delimiters but be more careful
+    parts = re.split(r'[-,;/]', size_str)
+    
+    max_size = 0
+    max_size_str = ''
+
+    for part in parts:
+        # Extract numeric value with diameter symbol
+        diameter_match = re.search(r'([øØ∅]?)\s*(\d+(?:\.\d+)?)', part)
+        if diameter_match:
+            symbol, value_str = diameter_match.groups()
+            size_value = float(value_str)
+            
+            if size_value > max_size:
+                max_size = size_value
+                symbol = symbol or ''
+                max_size_str = f"{symbol}{int(size_value)}"
+
+    return max_size_str
+
+# ============================
+# ENHANCED STEEL PROPERTIES LOOKUP
 # ============================
 
 def generate_name_variants(name: str):
     """
-    Generate likely lookup variants for steel/structural names.
-
-    Examples:
-      - "410UB60" -> ["410UB60","410 UB 60","410UB 60","410 UB60"]
-      - "125x6SHS" -> ["125x6SHS","125 x 125 x 6 SHS","125x125x6 SHS","125 x 6 SHS", ...]
+    Generate steel name variants for lookup - enhanced version for "200 DHS Purlin" etc.
     """
     if not name or pd.isna(name):
         return []
 
     s = str(name).strip()
-    # canonical uppercase no-space form for detection
     canonical = re.sub(r'\s+', '', s).upper()
-    canonical = canonical.replace('×', 'X')  # some sources use multiplication symbol
-    variants = set()
-    variants.add(s)
-    variants.add(canonical)
+    canonical = canonical.replace('×', 'X')
+    
+    variants = set([s, canonical])
 
-# DHS Purlin
-    m = re.search(r"(\\d+)\\s*DHS", canonical, re.IGNORECASE)
-    if m:
-        depth = m.group(1)
-        variants.update({
-            f"{depth} DHS",           # matches row 124 directly
-            f"{depth}DHS",
-            f"{depth} DHS Purlin",    # input form
-            f"DHS {depth}",
-            f"DHS{depth}"
-        })
-    # Also handle cases where there may be trailing text like "410UB60L" or "410UB60 A" 
-    # capture numeric-UB/UC within a longer string
-    m2 = re.search(r'(\d+)(UB|UC)(\d+)', canonical)
-    if m2:
-        depth, typ, weight = m2.groups()
-        typ = typ.upper()
+    # Enhanced DHS patterns - handle "200 DHS Purlin" better
+    dhs_patterns = [
+        r"(\d+)\s*DHS\s*PURLIN",  # "200 DHS Purlin"
+        r"(\d+)\s*DHS",           # "200 DHS"
+        r"DHS\s*(\d+)",           # "DHS 200"
+    ]
+    
+    for pattern in dhs_patterns:
+        match = re.search(pattern, canonical, re.IGNORECASE)
+        if match:
+            depth = match.group(1)
+            variants.update({
+                f"{depth} DHS",
+                f"{depth}DHS", 
+                f"DHS {depth}",
+                f"DHS{depth}",
+                f"{depth} DHS Purlin",
+                f"{depth}DHS Purlin",
+                f"DHS {depth} Purlin"
+            })
+
+    # UB/UC patterns
+    ub_match = re.search(r'(\d+)(UB|UC)(\d+)', canonical)
+    if ub_match:
+        depth, typ, weight = ub_match.groups()
         variants.update({
             f"{depth}{typ}{weight}",
             f"{depth} {typ} {weight}",
             f"{depth}{typ} {weight}",
             f"{depth} {typ}{weight}"
         })
-        # also include substring forms
-        variants.add(canonical[m2.start():m2.end()])
 
-    # --- SHS/RHS patterns
-    # Cases:
-    #  - 125x6SHS  (implies 125x125x6)
-    #  - 125x125x6SHS
-    #  - 125 X 6 SHS
+    # SHS/RHS patterns
     shs_match = re.match(r'^(\d+)X(\d+)(SHS|RHS)$', canonical)
     if shs_match:
         a, b, shape = shs_match.groups()
-        shape = shape.upper()
-        # Common variations to try:
         variants.update({
             f"{a}x{b}{shape}",
             f"{a} x {a} x {b} {shape}",
@@ -140,169 +456,562 @@ def generate_name_variants(name: str):
             f"{a}x{b} {shape}"
         })
 
-    shs_match2 = re.match(r'^(\d+)X(\d+)X(\d+)(SHS|RHS)$', canonical)
-    if shs_match2:
-        a, b, c, shape = shs_match2.groups()
-        shape = shape.upper()
-        variants.update({
-            f"{a}x{b}x{c}{shape}",
-            f"{a} x {b} x {c} {shape}",
-            f"{a}x{b}x{c} {shape}"
-        })
-
-    # --- CHS (circular hollow sections) or generic patterns like "Ø50" are not critical here,
-    # but include a simple no-space / spaced form
-    # Add spaced tokens for anything with letters and numbers e.g. "125X6SHS" -> "125 X 6 SHS"
+    # Add spaced variants
     spaced = re.sub(r'([A-Z])', r' \1', canonical).strip()
     spaced = re.sub(r'\s+', ' ', spaced)
     variants.add(spaced)
 
-    # Also include lower/upper, and remove duplicate whitespace variants:
+    # Normalize and clean variants
     final_variants = set()
     for v in variants:
-        if not v:
-            continue
-        final_variants.add(v)
-        final_variants.add(v.upper())
-        final_variants.add(v.title())
-        # also add a cleaned space-normalized version
-        final_variants.add(re.sub(r'\s+', ' ', v).strip())
+        if v and v.strip():
+            clean_v = re.sub(r'\s+', ' ', v.strip())
+            final_variants.add(clean_v)
+            final_variants.add(clean_v.upper())
+            final_variants.add(clean_v.title())
 
-    # return as a list, prefer preserving likely variants first by sorting length desc
     return sorted(final_variants, key=lambda x: (-len(x), x))
 
-# ============================
-# Lookup steel properties (variant-aware)
-# ============================
 def lookup_steel_properties(steel_name, size_lookup_df):
     """
-    Look up steel properties from size lookup table
+    Enhanced steel properties lookup with better variant matching
     Returns: (size_string, material)
-    Uses generate_name_variants() to try a number of normalized forms.
     """
     if size_lookup_df is None or steel_name is None or pd.isna(steel_name):
         return ('', '')
 
     try:
-        # prepare columns to check (case sensitive presence check)
-        name_columns = ['Steel Name', 'Name', 'Steel', 'Item Name']
-        # fallback to any column with 'name' in it if none of the above exist
-        available_name_cols = [c for c in size_lookup_df.columns if c in name_columns]
+        # Get available name columns
+        available_name_cols = []
+        for col in COLUMN_MAPPING.size_lookup_name_cols:
+            if col in size_lookup_df.columns:
+                available_name_cols.append(col)
+        
         if not available_name_cols:
+            # Fallback to any column with 'name' in it
             available_name_cols = [c for c in size_lookup_df.columns if 'name' in c.lower()]
-
+            
         if not available_name_cols:
-            # no name-like columns; can't match
             return ('', '')
 
         variants = generate_name_variants(steel_name)
 
-        # 1) Exact (normalized) matches first
-        match_row = None
+        # 1) Try exact matches first
         for variant in variants:
-            v_norm = variant.strip().lower()
             for col in available_name_cols:
-                col_series = size_lookup_df[col].astype(str).fillna('').str.strip().str.lower()
-                matches = size_lookup_df[col_series == v_norm]
-                if not matches.empty:
-                    match_row = matches.iloc[0]
-                    break
-            if match_row is not None:
-                break
+                col_values = size_lookup_df[col].astype(str).fillna('').str.strip()
+                exact_matches = size_lookup_df[col_values.str.lower() == variant.lower()]
+                
+                if not exact_matches.empty:
+                    match_row = exact_matches.iloc[0]
+                    size_str, material = extract_size_and_material_from_lookup(match_row)
+                    return (size_str, material)
 
-        # 2) Stricter partial matches using word boundaries (avoid matching '200' inside '1200')
-        if match_row is None:
-            for variant in variants:
-                # use word-boundary anchored pattern to avoid accidental substring hits
-                pat = rf"\b{re.escape(variant)}\b"
-                for col in available_name_cols:
-                    matches = size_lookup_df[size_lookup_df[col].astype(str).str.contains(pat, case=False, regex=True, na=False)]
-                    if not matches.empty:
-                        match_row = matches.iloc[0]
-                        break
-                if match_row is not None:
-                    break
-
-
-#        match_row = None
-#
-#        # Exact equality attempts (normalized)
-#        for variant in variants:
-#            v_norm = variant.strip().lower()
-#            for col in available_name_cols:
-#                # cast to str to avoid dtype issues, strip then lower
-#                col_series = size_lookup_df[col].astype(str).fillna('').str.strip().str.lower()
-#                matches = size_lookup_df[col_series == v_norm]
-#                if not matches.empty:
-#                    match_row = matches.iloc[0]
-#                    break
-#            if match_row is not None:
-#                break
-#
-#        # Partial contains attempts if exact match failed
-#        if match_row is None:
-#            for variant in variants:
-#                v_norm = variant.strip()
-#                for col in available_name_cols:
-#                    try:
-#                        # contains with case-insensitive
-#                        matches = size_lookup_df[size_lookup_df[col].astype(str).str.contains(re.escape(v_norm), case=False, na=False)]
-#                    except Exception:
-#                        # fallback generic contains
-#                        matches = size_lookup_df[size_lookup_df[col].astype(str).str.contains(v_norm, case=False, na=False)]
-#                    if not matches.empty:
-#                        match_row = matches.iloc[0]
-#                        break
-#                if match_row is not None:
-#                    break
-
-        if match_row is not None:
-            # Extract size information (try to find width/height-like columns)
-            width_col = None
-            height_col = None
-            for col in match_row.index:
-                if 'width' in col.lower():
-                    width_col = col
-                if 'height' in col.lower():
-                    height_col = col
-            size_str = ''
-            if width_col and height_col:
-                try:
-                    width_val = float(str(match_row[width_col]).replace('mm','').strip())
-                    height_val = float(str(match_row[height_col]).replace('mm','').strip())
-                    size_str = f"{int(round(height_val))}x{int(round(width_val))}"
-                except:
-                    width = str(match_row[width_col]).replace('mm', '').strip()
-                    height = str(match_row[height_col]).replace('mm', '').strip()
-                    size_str = f"{height}x{width}"
-
-
-            # Extract material information
-            material = ''
-            material_columns = ['Material', 'Materials', 'Type']
-            for col in material_columns:
-                if col in match_row.index and pd.notna(match_row[col]):
-                    material = str(match_row[col])
-                    break
-
-            return (size_str, material)
+        # 2) Try partial matches for steel names like "200 DHS Purlin"
+        for variant in variants:
+            for col in available_name_cols:
+                for _, row in size_lookup_df.iterrows():
+                    lookup_value = str(row[col]) if pd.notna(row[col]) else ""
+                    if not lookup_value.strip():
+                        continue
+                    
+                    # Check if variant is contained in lookup value or vice versa
+                    if (variant.lower() in lookup_value.lower() or 
+                        lookup_value.lower() in variant.lower()):
+                        size_str, material = extract_size_and_material_from_lookup(row)
+                        if size_str or material:
+                            return (size_str, material)
 
     except Exception as e:
-        # swallow errors to keep UI running; optionally log to st.warning in debug mode
-        # st.warning(f"Lookup error for '{steel_name}': {e}")
-        pass
+        st.warning(f"Lookup error for '{steel_name}': {e}")
 
     return ('', '')
 
+def extract_size_and_material_from_lookup(match_row):
+    """Extract size and material information from lookup table row"""
+    size_str = ''
+    material = ''
+    
+    # Extract size information
+    width_col = height_col = None
+    for col in COLUMN_MAPPING.size_lookup_width_cols:
+        if col in match_row.index:
+            width_col = col
+            break
+    for col in COLUMN_MAPPING.size_lookup_height_cols:
+        if col in match_row.index:
+            height_col = col
+            break
+            
+    if width_col and height_col:
+        try:
+            width_val = str(match_row[width_col]).replace('mm','').strip()
+            height_val = str(match_row[height_col]).replace('mm','').strip()
+            
+            # Try to convert to numbers for proper formatting
+            try:
+                width_num = float(width_val)
+                height_num = float(height_val)
+                size_str = f"{int(round(height_num))}x{int(round(width_num))}"
+            except:
+                size_str = f"{height_val}x{width_val}"
+        except:
+            pass
+
+    # Extract material information
+    for col in COLUMN_MAPPING.size_lookup_material_cols:
+        if col in match_row.index and pd.notna(match_row[col]):
+            material = str(match_row[col])
+            break
+
+    return size_str, material
+
 # ============================
-# Other utility functions (unchanged / slightly polished)
+# ENHANCED MATERIAL CLASSIFICATION
 # ============================
-def load_excel_with_sheet_selection(file_content):
-    """
-    Load Excel file with automatic second sheet selection if multiple sheets exist
-    """
+
+def classify_material_by_keywords(text):
+    """Enhanced material classification with more comprehensive keywords"""
+    if not text or pd.isna(text):
+        return ''
+
+    text_lower = str(text).lower()
+
+    # Enhanced keyword patterns with priority
+    material_patterns = [
+        (r'\b(?:steel|gal|fp_gal|metal-steel)\b', 'Steel'),
+        (r'\b(?:pvc|plastic)\b', 'PVC'),
+        (r'\b(?:pp-r|ppr|raufusion)\b', 'PP-R'),
+        (r'\b(?:copper|cu)\b', 'Copper'),
+        (r'\b(?:cast iron|iron)\b', 'Cast Iron'),
+        (r'\b(?:aluminium|aluminum|al)\b', 'Aluminium'),
+    ]
+    
+    for pattern, material in material_patterns:
+        if re.search(pattern, text_lower):
+            return material
+
+    return ''
+
+# ============================
+# ENHANCED LOOKUP MATERIAL MAPPING
+# ============================
+
+def lookup_material_mapping(material_text, materials_lookup_df):
+    """Enhanced material mapping lookup"""
+    if materials_lookup_df is None or not material_text or pd.isna(material_text):
+        return ''
+
     try:
-        # First, check how many sheets are in the file
+        # Get source and target columns
+        source_col = None
+        target_col = None
+
+        for col in COLUMN_MAPPING.materials_lookup_source_cols:
+            if col in materials_lookup_df.columns:
+                source_col = col
+                break
+        
+        for col in COLUMN_MAPPING.materials_lookup_target_cols:
+            if col in materials_lookup_df.columns:
+                target_col = col
+                break
+
+        # Fallback to first two columns
+        if source_col is None and len(materials_lookup_df.columns) >= 2:
+            source_col = materials_lookup_df.columns[0]
+            target_col = materials_lookup_df.columns[1]
+
+        if not source_col or not target_col:
+            return ''
+
+        material_lower = str(material_text).lower().strip()
+
+        # Try exact matches first
+        for _, row in materials_lookup_df.iterrows():
+            if pd.notna(row[source_col]):
+                source_value = str(row[source_col]).lower().strip()
+                
+                # Exact match
+                if source_value == material_lower:
+                    if pd.notna(row[target_col]):
+                        return str(row[target_col]).strip()
+
+        # Try partial matches
+        for _, row in materials_lookup_df.iterrows():
+            if pd.notna(row[source_col]):
+                source_value = str(row[source_col]).strip()
+                confidence = similarity_score(material_text, source_value)
+                
+                if confidence >= 0.75:
+                    if pd.notna(row[target_col]):
+                        return str(row[target_col]).strip()
+
+    except Exception as e:
+        st.warning(f"Material mapping error: {e}")
+
+    return ''
+
+# ============================
+# FIXED SERVICE PARSING - Issue 1 Fix
+# ============================
+
+def parse_service(title, csv_data):
+    """
+    FIXED: Parse service information with specific part-based logic
+    
+    Logic:
+    1. Extract discipline from FIRST part: "ARC (Fyreline) vs HYD" → "HYD" → "Hydraulic"
+    2. Extract element ID from LAST part: "Pipe Fittings - Standard - 2570300 [173]" → "2570300"
+    3. Use element ID to lookup System Classification and Item Type from CSV
+    4. Format as: "{Discipline} - {System Classification} {Item Type}"
+    """
+    if pd.isna(title) or not title:
+        return ''
+
+    try:
+        # Service type mapping
+        service_lookup = {
+            'FIR': 'Fire', 'ELE': 'Electric', 'HYD': 'Hydraulic',
+            'MEC': 'Mechanical', 'STR': 'Structural'
+        }
+
+        # Split by "|"
+        parts = title.split('|')
+        if len(parts) < 3:  # Need at least 3 parts for this logic
+            return ''
+
+        # STEP 1: Extract discipline from FIRST part
+        first_part = parts[0].strip()
+        service_code = ''
+        
+        # Look for service codes anywhere in first part
+        for code in service_lookup.keys():
+            if re.search(rf'\b{code}\b', first_part):
+                service_code = code
+                break
+        
+        # Fallback: try last 3 chars of first part
+        if not service_code:
+            service_code = first_part[-3:]
+        
+        service_name = service_lookup.get(service_code, service_code)
+
+        # STEP 2: Extract element ID from LAST part
+        last_part = parts[-1].strip()  # Get the last part
+        element_id = None
+        
+        # Look for element ID patterns in last part
+        id_matches = re.findall(r'-\s*(\d{6,})(?:\s*\[|$)', last_part)
+        if id_matches:
+            element_id = int(id_matches[0])
+        else:
+            # Also check for IDs before brackets
+            bracket_matches = re.findall(r'(\d{6,})\s*\[', last_part)
+            if bracket_matches:
+                element_id = int(bracket_matches[0])
+
+        if not element_id:
+            return f"{service_name} - "
+
+        # STEP 3: Lookup System Classification and Item Type using element ID
+        matches = csv_data[csv_data[COLUMN_MAPPING.csv_id_column] == element_id]
+        if not matches.empty:
+            match_row = matches.iloc[0]
+            
+            # Get System Classification
+            system_classification = ''
+            if (COLUMN_MAPPING.csv_system_classification in match_row.index and 
+                pd.notna(match_row[COLUMN_MAPPING.csv_system_classification])):
+                system_classification = str(match_row[COLUMN_MAPPING.csv_system_classification]).strip()
+            
+            # Get Item Type (from CSV, not from title parts)
+            item_type = ''
+            if (COLUMN_MAPPING.csv_item_type in match_row.index and 
+                pd.notna(match_row[COLUMN_MAPPING.csv_item_type])):
+                item_type = str(match_row[COLUMN_MAPPING.csv_item_type]).strip()
+            
+            # ENHANCED: If Item Type is "Standard" (case insensitive), use Item Name instead
+            if item_type.lower() == 'standard':
+                # Get Item Name as replacement
+                if (COLUMN_MAPPING.csv_item_name in match_row.index and 
+                    pd.notna(match_row[COLUMN_MAPPING.csv_item_name])):
+                    item_name = str(match_row[COLUMN_MAPPING.csv_item_name]).strip()
+                    # Only use Item Name if it's not generic like "Pipe Types"
+                    if item_name and item_name.lower() != 'pipe types':
+                        item_type = item_name
+                    else:
+                        item_type = ''  # Clear it if it's generic
+            
+            # STEP 4: Build service description: {Discipline} - {System Classification} {Item Type}
+            service_desc = service_name
+            if system_classification and item_type:
+                service_desc += f" - {system_classification} {item_type}"
+            elif system_classification:
+                service_desc += f" - {system_classification}"
+            elif item_type:
+                service_desc += f" - {item_type}"
+            else:
+                service_desc += " - "
+                
+            return service_desc
+
+        return f"{service_name} - "
+
+    except Exception as e:
+        return ''
+
+# ============================
+# FIXED FRR RETRIEVAL - Issue 2 Fix
+# ============================
+
+def get_frr_info(ceiling_info, csv_data, element_ids=None, confidence_threshold=0.8):
+    """
+    FIXED: Get FRR info using Item Type from second part of title
+    
+    Logic:
+    1. ceiling_info comes from SECOND part: "Ceilings - 53-Clg_(CT10) 16mm Fyreline"
+    2. Extract Item Type: "53-Clg_(CT10) 16mm Fyreline" (after first " - ")
+    3. Search CSV where Item_Type matches this extracted value
+    4. Return FRR value from matching row
+    """
+    
+    if not ceiling_info:
+        return ''
+
+    try:
+        # STEP 1: Extract Item Type from ceiling_info (which is the second part)
+        # ceiling_info format: "Ceilings - 53-Clg_(CT10) 16mm Fyreline"
+        # We want: "53-Clg_(CT10) 16mm Fyreline"
+        
+        item_type_to_search = ''
+        if ' - ' in ceiling_info:
+            # Split on first " - " and take everything after
+            parts = ceiling_info.split(' - ', 1)
+            if len(parts) > 1:
+                item_type_to_search = parts[1].strip()
+        else:
+            # If no " - " found, use the whole string
+            item_type_to_search = ceiling_info.strip()
+
+        if not item_type_to_search:
+            return ''
+
+        # STEP 2: Search CSV for Item Type matches
+        matching_rows = pd.DataFrame()
+        
+        # Try exact match first
+        exact_matches = csv_data[csv_data[COLUMN_MAPPING.csv_item_type].astype(str).str.strip() == item_type_to_search]
+        if not exact_matches.empty:
+            matching_rows = exact_matches
+        else:
+            # Try partial match (contains)
+            partial_matches = csv_data[csv_data[COLUMN_MAPPING.csv_item_type].astype(str).str.contains(
+                re.escape(item_type_to_search), case=False, na=False, regex=True
+            )]
+            if not partial_matches.empty:
+                matching_rows = partial_matches
+            else:
+                # Try word-by-word search for better matching
+                words = item_type_to_search.split()
+                for word in words:
+                    if len(word) > 4:  # Only significant words
+                        word_matches = csv_data[csv_data[COLUMN_MAPPING.csv_item_type].astype(str).str.contains(
+                            re.escape(word), case=False, na=False, regex=True
+                        )]
+                        if not word_matches.empty:
+                            matching_rows = word_matches
+                            break
+
+        # STEP 3: Get FRR value from matching rows
+        if not matching_rows.empty:
+            frr_values = matching_rows[COLUMN_MAPPING.csv_frr].dropna().unique()
+            
+            if len(frr_values) == 0:
+                return ''
+            elif len(frr_values) == 1:
+                return str(frr_values[0])
+            else:
+                # Multiple values found - return first or show warning
+                unique_values = set(str(v) for v in frr_values)
+                if len(unique_values) == 1:
+                    return str(frr_values[0])
+                else:
+                    return f"WARNING: Multiple FRR values found: {', '.join(str(v) for v in frr_values)}"
+
+        # STEP 4: Fallback - try element ID lookup if Item Type search failed
+        if element_ids:
+            for element_id in element_ids:
+                if isinstance(element_id, (int, float)):
+                    matches = csv_data[csv_data[COLUMN_MAPPING.csv_id_column] == element_id]
+                    if not matches.empty:
+                        match_row = matches.iloc[0]
+                        frr_value = match_row.get(COLUMN_MAPPING.csv_frr)
+                        if pd.notna(frr_value) and frr_value:
+                            return str(frr_value)
+
+        return ''
+
+    except Exception as e:
+        return ''
+
+# ============================
+# ENHANCED MATERIAL RETRIEVAL
+# ============================
+
+def get_service_material_enhanced(element_ids, service_text, csv_data, 
+                                 materials_lookup=None, size_lookup=None):
+    """Enhanced service material retrieval with multiple sources"""
+    
+    # Priority 1: Keyword detection on service text
+    keyword_material = classify_material_by_keywords(service_text)
+    if keyword_material:
+        return keyword_material
+
+    if not element_ids:
+        return ''
+
+    # Extract string identifiers from element_ids
+    string_identifiers = [str(eid) for eid in element_ids if isinstance(eid, str)]
+
+    # Priority 2: CSV mechanical material lookup
+    mechanical_material = unified_data_retrieval(
+        csv_data, element_ids, string_identifiers,
+        [COLUMN_MAPPING.csv_mechanical_material],
+        COLUMN_MAPPING.csv_id_column, confidence_threshold=0.7
+    )
+
+    if mechanical_material:
+        # Apply keyword classification to CSV result
+        classified = classify_material_by_keywords(mechanical_material)
+        if classified:
+            return classified
+        
+        # Try materials lookup on CSV result
+        if materials_lookup is not None:
+            lookup_result = lookup_material_mapping(mechanical_material, materials_lookup)
+            if lookup_result:
+                return lookup_result
+        
+        return mechanical_material
+
+    # Priority 3: CSV structural material lookup  
+    structural_material = unified_data_retrieval(
+        csv_data, element_ids, string_identifiers,
+        [COLUMN_MAPPING.csv_structural_material],
+        COLUMN_MAPPING.csv_id_column, confidence_threshold=0.7
+    )
+
+    if structural_material:
+        classified = classify_material_by_keywords(structural_material)
+        if classified:
+            return classified
+        
+        if materials_lookup is not None:
+            lookup_result = lookup_material_mapping(structural_material, materials_lookup)
+            if lookup_result:
+                return lookup_result
+        
+        return structural_material
+
+    # Priority 4: Size lookup table material (for structural elements)
+    if size_lookup is not None and service_text and 'Structural' in service_text:
+        # Extract steel name from service text - ENHANCED extraction
+        parts = service_text.split('-')
+        if len(parts) >= 2:
+            # Get the part after "Structural -" and clean it up
+            steel_part = parts[1].strip()
+            
+            # Try to extract steel name - could be "200 DHS Purlin", "410UB60", etc.
+            steel_name = steel_part.split()[0] if steel_part.split() else steel_part
+            
+            # For cases like "200 DHS Purlin", we want the full "200 DHS Purlin" or "200 DHS"
+            if 'DHS' in steel_part.upper():
+                # Extract the full DHS description
+                dhs_match = re.search(r'(\d+\s*DHS(?:\s*Purlin)?)', steel_part, re.IGNORECASE)
+                if dhs_match:
+                    steel_name = dhs_match.group(1).strip()
+            
+            _, material = lookup_steel_properties(steel_name, size_lookup)
+            if material:
+                return material
+
+    return ''
+
+# ============================
+# ENHANCED SIZE RETRIEVAL
+# ============================
+
+def get_pipe_size_enhanced(element_ids, csv_data, service_text, size_lookup=None):
+    """Enhanced pipe size retrieval with rectangular preservation and material integration"""
+    
+    if not element_ids:
+        return '', ''
+
+    # Extract string identifiers
+    string_identifiers = [str(eid) for eid in element_ids if isinstance(eid, str)]
+
+    # Priority 1: Size lookup for structural elements
+    if service_text and 'Structural' in service_text and size_lookup is not None:
+        parts = service_text.split('-')
+        if len(parts) >= 2:
+            # Enhanced steel name extraction for cases like "Structural - 200 DHS Purlin"
+            steel_part = parts[1].strip()
+            steel_name = steel_part.split()[0] if steel_part.split() else steel_part
+            
+            # For DHS elements, get the full description
+            if 'DHS' in steel_part.upper():
+                dhs_match = re.search(r'(\d+\s*DHS(?:\s*Purlin)?)', steel_part, re.IGNORECASE)
+                if dhs_match:
+                    steel_name = dhs_match.group(1).strip()
+            
+            size_str, material = lookup_steel_properties(steel_name, size_lookup)
+            
+            if size_str:
+                return size_str, material
+
+    # Priority 2: CSV geometry size lookup
+    geometry_size = unified_data_retrieval(
+        csv_data, element_ids, string_identifiers,
+        [COLUMN_MAPPING.csv_size],
+        COLUMN_MAPPING.csv_id_column, confidence_threshold=0.7
+    )
+
+    if geometry_size:
+        # Apply enhanced size extraction
+        extracted_size = extract_largest_pipe_size(geometry_size)
+        if extracted_size:
+            return extracted_size, ''
+
+    return '', ''
+
+# ============================
+# SIMPLIFIED SEPARATING ELEMENT RETRIEVAL
+# ============================
+
+def get_separating_element_enhanced(ceiling_info, csv_data, element_ids=None):
+    """Simplified separating element retrieval - just return the middle section from title"""
+    
+    if not ceiling_info:
+        return ''
+
+    try:
+        # Clean ceiling info (remove element ID at the end)
+        clean_ceiling_info = re.sub(r'-\s*\d{6,}\s*(?:\||$)', '', ceiling_info).strip()
+        
+        # Return the cleaned ceiling info as-is (the middle section of title split by "|")
+        return clean_ceiling_info
+
+    except Exception as e:
+        return ceiling_info  # Fallback to original
+
+# ============================
+# UTILITY FUNCTIONS
+# ============================
+
+def load_excel_with_sheet_selection(file_content):
+    """Load Excel file with automatic sheet selection"""
+    try:
         excel_file = pd.ExcelFile(io.BytesIO(file_content))
         sheet_names = excel_file.sheet_names
 
@@ -337,519 +1046,55 @@ def load_lookup_table(file_content, file_type, table_name):
         st.warning(f"Could not load {table_name}: {e}")
         return None
 
-def extract_element_id_from_ceiling_info(ceiling_info):
-    """
-    Extract element ID from ceiling/wall info string
-    Example: "Ceilings - 53-Clg_(CT10) 16mm Fyreline - 6681320" -> 6681320
-    """
-    if not ceiling_info:
-        return None
-
-    try:
-        # Look for pattern: "- [digits]" at the end or before the last pipe
-        match = re.search(r'-\s*(\d{6,})\s*$', ceiling_info)
-        if match:
-            return int(match.group(1))
-
-        match = re.search(r'-\s*(\d{6,})\s*(?:\||$)', ceiling_info)
-        if match:
-            return int(match.group(1))
-
-    except Exception as e:
-        pass
-
-    return None
-
-def classify_material_by_keywords(text):
-    """
-    Classify material based on keyword detection (case-insensitive)
-    Priority order: Steel, PVC, PP-R
-    """
-    if not text or pd.isna(text):
-        return ''
-
-    text_lower = str(text).lower()
-
-    # Check for keywords in priority order
-    if 'steel' in text_lower or 'gal' in text_lower or 'fp_gal' in text_lower:
-        return 'Steel'
-    elif 'pvc' in text_lower or 'plastic' in text_lower:
-        return 'PVC'
-    elif 'pp-r' in text_lower or 'ppr' in text_lower or 'raufusion' in text_lower:
-        return 'PP-R'
-    elif 'copper' in text_lower:
-        return 'Copper'
-
-    return ''
-
-def extract_largest_pipe_size(size_text):
-    """
-    Extract the largest pipe size from a string containing multiple sizes
-    Examples: 
-    - "Ø32 mm-Ø32 mm" -> "Ø32"
-    - "ø65-ø65-ø40-ø40-ø40" -> "ø65"
-    """
-    if not size_text or pd.isna(size_text):
-        return ''
-
-    size_str = str(size_text)
-
-    # Split by common delimiters
-    parts = re.split(r'[-,;/]', size_str)
-
-    max_size = 0
-    max_size_str = ''
-
-    for part in parts:
-        # Extract numeric value from each part
-        numeric_match = re.search(r'[øØ∅]?\s*(\d+(?:\.\d+)?)', part)
-        if numeric_match:
-            size_value = float(numeric_match.group(1))
-            if size_value > max_size:
-                max_size = size_value
-                # Preserve the original format with symbol
-                symbol_match = re.search(r'([øØ∅])', part)
-                if symbol_match:
-                    max_size_str = f"{symbol_match.group(1)}{int(size_value)}"
-                else:
-                    max_size_str = str(int(size_value))
-
-    return max_size_str
-
-def lookup_material_mapping(material_text, materials_lookup_df):
-    """
-    Look up material mapping from materials lookup table
-    """
-    if materials_lookup_df is None or not material_text or pd.isna(material_text):
-        return ''
-
-    try:
-        material_lower = str(material_text).lower()
-
-        # Check for columns that might contain material mappings
-        source_columns = ['Material Name', 'Source Material', 'Original', 'Input']
-        target_columns = ['Mapped Material', 'Target Material', 'Output', 'Standard Material']
-
-        source_col = None
-        target_col = None
-
-        # Find the source and target columns
-        for col in materials_lookup_df.columns:
-            if col in source_columns or 'name' in col.lower() or 'source' in col.lower():
-                source_col = col
-            if col in target_columns or 'mapped' in col.lower() or 'target' in col.lower():
-                target_col = col
-
-        # If we couldn't identify columns, try using first two columns
-        if source_col is None and len(materials_lookup_df.columns) >= 2:
-            source_col = materials_lookup_df.columns[0]
-            target_col = materials_lookup_df.columns[1]
-
-        if source_col and target_col:
-            # Look for exact match first
-            for _, row in materials_lookup_df.iterrows():
-                if pd.notna(row[source_col]) and str(row[source_col]).lower() == material_lower:
-                    if pd.notna(row[target_col]):
-                        return str(row[target_col])
-
-            # Try partial match
-            for _, row in materials_lookup_df.iterrows():
-                if pd.notna(row[source_col]) and str(row[source_col]).lower() in material_lower:
-                    if pd.notna(row[target_col]):
-                        return str(row[target_col])
-
-    except Exception as e:
-        pass
-
-    return ''
-
-def validate_element_type_match(category, data_row, is_wall, is_ceiling, is_floor):
-    """
-    Validate that the data row is appropriate for the element type
-    """
-    item_type = ''
-    if hasattr(data_row, 'get'):
-        item_type = str(data_row.get('Item→Type', '')).lower()
-    elif 'Item→Type' in data_row.index:
-        item_type = str(data_row['Item→Type']).lower()
-
-    if not item_type:
-        return True
-
-    # Define indicators for different element types
-    wall_indicators = ['wall', 'ext-', 'int-', 'fyreline', 'plasterboard', 'gypsum', 
-                      'stud', 'party', 'external', 'internal']
-    ceiling_indicators = ['ceiling', 'clg', 'soffit', 'suspended']
-    floor_indicators = ['floor', 'flr', 'slab', 'deck', 'concrete']
-
-    # Check what type the data actually represents
-    has_wall_data = any(indicator in item_type for indicator in wall_indicators)
-    has_ceiling_data = any(indicator in item_type for indicator in ceiling_indicators)
-    has_floor_data = any(indicator in item_type for indicator in floor_indicators)
-
-    # Validation rules
-    if is_ceiling:
-        if has_wall_data and not has_ceiling_data:
-            return False
-        return has_ceiling_data or (not has_wall_data and not has_floor_data)
-
-    elif is_floor:
-        if has_wall_data and not has_floor_data:
-            return False
-        return has_floor_data or (not has_wall_data and not has_ceiling_data)
-
-    elif is_wall:
-        if (has_ceiling_data or has_floor_data) and not has_wall_data:
-            return False
-        return True
-
-    return True
+# ============================
+# MAIN PROCESSING FUNCTION
+# ============================
 
 def process_passive_fire_schedule(excel_file_content, csv_file_content, 
                                  size_lookup_content=None, size_lookup_type=None,
                                  materials_lookup_content=None, materials_lookup_type=None):
-    """
-    Process passive fire schedule data with dual lookup table support
-    """
+    """Enhanced passive fire schedule processing with FIXED Service & FRR logic"""
 
     try:
-        # Read the Excel file with multi-sheet detection
+        # Read the Excel file
         excel_df = load_excel_with_sheet_selection(excel_file_content)
         if excel_df is None:
             return None
-        st.success(f"✔ Excel file loaded: {len(excel_df)} rows")
+        st.success(f"✅ Excel file loaded: {len(excel_df)} rows")
 
-        # Read the CSV file
+        # Read the CSV file  
         csv_df = pd.read_csv(io.BytesIO(csv_file_content))
-        st.success(f"✔ CSV file loaded: {len(csv_df)} rows")
+        st.success(f"✅ CSV file loaded: {len(csv_df)} rows")
+
+        # Standardize CSV column names (position-based renaming)
+        csv_df = standardize_csv_columns_by_position(csv_df)
 
         # Load optional lookup tables
         size_lookup_df = None
         if size_lookup_content and size_lookup_type:
             size_lookup_df = load_lookup_table(size_lookup_content, size_lookup_type, "Size Lookup Table")
             if size_lookup_df is not None:
-                st.success(f"✔ Size Lookup Table loaded: {len(size_lookup_df)} rows")
+                st.success(f"✅ Size Lookup Table loaded: {len(size_lookup_df)} rows")
 
         materials_lookup_df = None
         if materials_lookup_content and materials_lookup_type:
             materials_lookup_df = load_lookup_table(materials_lookup_content, materials_lookup_type, "Materials Lookup Table")
             if materials_lookup_df is not None:
-                st.success(f"✔ Materials Lookup Table loaded: {len(materials_lookup_df)} rows")
+                st.success(f"✅ Materials Lookup Table loaded: {len(materials_lookup_df)} rows")
 
     except Exception as e:
         st.error(f"Error reading files: {e}")
         return None
 
-    # Service type mapping
-    service_lookup = {
-        'FIR': 'Fire',
-        'ELE': 'Electric', 
-        'HYD': 'Hydraulic',
-        'MEC': 'Mechanical',
-        'STR': 'Structural'
-    }
-
-    def parse_service(title, csv_data):
-        """Parse the service information from title string"""
-        if pd.isna(title) or not title:
-            return ''
-
-        try:
-            # Split by "|"
-            parts = title.split('|')
-            if len(parts) < 3:
-                return ''
-
-            # Extract service type from first part
-            first_part = parts[0].strip()
-            service_code = first_part[-3:]
-            service_name = service_lookup.get(service_code, service_code)
-
-            # Extract element ID from third part
-            third_part = parts[2].strip()
-            element_id_match = re.search(r'(\d+)\s*\[', third_part)
-            if not element_id_match:
-                return service_name + ' - '
-
-            element_id = int(element_id_match.group(1))
-
-            # Find matching row in CSV data
-            matching_rows = csv_data[csv_data['Revizto→Authoring Tool Id'] == element_id]
-            if matching_rows.empty:
-                return service_name + ' - '
-
-            matching_row = matching_rows.iloc[0]
-
-            # Build service description
-            service_desc = service_name + ' - '
-
-            # Add System Classification
-            if pd.notna(matching_row.get('MECHANICAL→System Classification')):
-                service_desc += str(matching_row['MECHANICAL→System Classification']) + ' '
-
-            # Add Insulation Thickness
-            insul_thickness = matching_row.get('INSULATION→Insulation Thickness mm')
-            if pd.notna(insul_thickness) and insul_thickness > 0:
-                service_desc += str(int(insul_thickness)) + 'mm '
-
-            # Add Item Type or Item Name
-            item_type = matching_row.get('Item→Type')
-            item_name = matching_row.get('Item→Name')
-
-            if pd.notna(item_type) and not str(item_type).lower().startswith('standard'):
-                service_desc += str(item_type)
-            elif pd.notna(item_name):
-                service_desc += str(item_name)
-
-            # Add Insulation Type if exists
-            insul_type = matching_row.get('INSULATION→Insulation Type')
-            if pd.notna(insul_type):
-                thickness_val = insul_thickness if pd.notna(insul_thickness) else ''
-                service_desc += f" with {thickness_val}mm {insul_type}"
-
-            return service_desc.strip()
-
-        except Exception as e:
-            return ''
-
-    def get_service_material_enhanced(element_id, service_text, csv_data, materials_lookup=None):
-        """
-        Get service material with keyword detection and lookup table support
-        Priority: 1. Keyword detection, 2. CSV data, 3. Materials lookup table
-        """
-        # First, try keyword detection on the service text
-        keyword_material = classify_material_by_keywords(service_text)
-        if keyword_material:
-            return keyword_material
-
-        # If no element_id, skip CSV lookup
-        if pd.isna(element_id):
-            return ''
-
-        # Try to get from CSV
-        matching_rows = csv_data[csv_data['Revizto→Authoring Tool Id'] == element_id]
-        if not matching_rows.empty:
-            matching_row = matching_rows.iloc[0]
-
-            # Try Column K first (MECHANICAL→Material)
-            mechanical_material = matching_row.get('MECHANICAL→Material')
-            if pd.notna(mechanical_material):
-                # Apply keyword classification
-                classified = classify_material_by_keywords(mechanical_material)
-                if classified:
-                    return classified
-
-                # Try materials lookup
-                if materials_lookup is not None:
-                    mapped = lookup_material_mapping(mechanical_material, materials_lookup)
-                    if mapped:
-                        return mapped
-
-                return str(mechanical_material)
-
-            # Try Column L (MATERIALS→Structural Material)
-            structural_material = matching_row.get('MATERIALS→Structural Material')
-            if pd.notna(structural_material):
-                # Apply keyword classification
-                classified = classify_material_by_keywords(structural_material)
-                if classified:
-                    return classified
-
-                # Try materials lookup
-                if materials_lookup is not None:
-                    mapped = lookup_material_mapping(structural_material, materials_lookup)
-                    if mapped:
-                        return mapped
-
-                return str(structural_material)
-
-        return ''
-
-    def get_pipe_size_enhanced(element_id, csv_data, service_text, size_lookup=None):
-        """
-        Get pipe size with enhanced extraction logic
-        Extracts largest value when multiple sizes are present
-        """
-        if pd.isna(element_id):
-            return ''
-
-        # Check if this is a structural element that needs size lookup
-        if service_text and 'Structural' in service_text and size_lookup is not None:
-            # Extract steel name from service text (e.g., "Structural - 410UB60")
-            parts = service_text.split('-')
-            if len(parts) >= 2:
-                # take the second part and split out first token-like element
-                steel_token = parts[1].strip()
-                steel_name_candidate = re.split(r'[\s,;/\(\)]+', steel_token)[0]
-                # pass to lookup routine (which will call generate_name_variants())
-                size_str, _ = lookup_steel_properties(steel_name_candidate, size_lookup)
-                if size_str:
-                    return size_str
-
-        # Regular pipe size extraction from CSV
-        matching_rows = csv_data[csv_data['Revizto→Authoring Tool Id'] == element_id]
-        if matching_rows.empty:
-            return ''
-
-        matching_row = matching_rows.iloc[0]
-        geometry_size = matching_row.get('GEOMETRY→Size')
-
-        if pd.notna(geometry_size):
-            # Apply enhanced extraction logic
-            return extract_largest_pipe_size(geometry_size)
-
-        return ''
-
-    def extract_element_id(title):
-        """Extract element ID from title for lookups"""
-        if pd.isna(title) or not title:
-            return None
-
-        try:
-            parts = title.split('|')
-            if len(parts) >= 3:
-                third_part = parts[2].strip()
-                element_id_match = re.search(r'(\d+)\s*\[', third_part)
-                if element_id_match:
-                    return int(element_id_match.group(1))
-        except:
-            pass
-        return None
-
-    def extract_ceiling_info(title):
-        """Extract the ceiling/wall information from the second split of title"""
-        if pd.isna(title) or not title:
-            return None
-
-        try:
-            parts = title.split('|')
-            if len(parts) >= 2:
-                return parts[1].strip()
-        except:
-            pass
-        return None
-
-    def get_frr_info(ceiling_info, csv_data):
-        """Get FRR information from CSV"""
-        if not ceiling_info:
-            return ''
-
-        try:
-            # Clean ceiling info for matching
-            clean_info = ceiling_info
-            element_id = extract_element_id_from_ceiling_info(ceiling_info)
-            if element_id:
-                clean_info = re.sub(r'-\s*\d{6,}\s*(?:\||$)', '', ceiling_info).strip()
-
-            # Find matching rows
-            matching_rows = csv_data[csv_data['Item→Type'].str.contains(clean_info, case=False, na=False)]
-
-            if matching_rows.empty:
-                words = clean_info.split()
-                for word in words:
-                    if len(word) > 4:
-                        partial_matches = csv_data[csv_data['Item→Type'].str.contains(word, case=False, na=False)]
-                        if not partial_matches.empty:
-                            matching_rows = partial_matches
-                            break
-
-            if matching_rows.empty:
-                return ''
-
-            # Get FRR values
-            frr_values = matching_rows['Revit Type→WALL FRR'].dropna().unique()
-
-            if len(frr_values) == 0:
-                return ''
-            elif len(frr_values) == 1:
-                return str(frr_values[0])
-            else:
-                unique_values = set(str(v) for v in frr_values)
-                if len(unique_values) == 1:
-                    return str(frr_values[0])
-                else:
-                    return f"WARNING: Multiple FRR values found: {', '.join(str(v) for v in frr_values)}"
-
-        except Exception as e:
-            return ''
-
-    def get_separating_element_enhanced(ceiling_info, csv_data):
-        """Get separating element with strict type validation"""
-        if not ceiling_info:
-            return ''
-
-        try:
-            # Extract element ID if present
-            element_id = extract_element_id_from_ceiling_info(ceiling_info)
-
-            # Clean ceiling info
-            clean_ceiling_info = ceiling_info
-            if element_id:
-                clean_ceiling_info = re.sub(r'-\s*\d{6,}\s*(?:\||$)', '', ceiling_info).strip()
-
-            # Parse category and details
-            category = ''
-            element_details = ''
-
-            if '-' in clean_ceiling_info:
-                parts = clean_ceiling_info.split('-', 1)
-                category = parts[0].strip()
-                element_details = parts[1].strip() if len(parts) > 1 else ''
-            else:
-                category = clean_ceiling_info.strip()
-
-            # Determine element type
-            element_type = category.lower()
-            is_wall = 'wall' in element_type
-            is_ceiling = 'ceiling' in element_type
-            is_floor = 'floor' in element_type
-
-            # For ceilings and floors, don't use wall data
-            if is_ceiling or is_floor:
-                # Clean up any wall-related terms
-                cleaned_info = clean_ceiling_info
-                wall_terms = ['Fyreline', 'EXT-', 'INT-', 'Plasterboard', 'Gypsum']
-                for term in wall_terms:
-                    cleaned_info = re.sub(f'\\s*-?\\s*{re.escape(term)}.*$', '', cleaned_info, flags=re.IGNORECASE)
-                return cleaned_info.strip()
-
-            # For walls, find and use wall data
-            if is_wall:
-                matching_rows = csv_data[csv_data['Item→Type'].str.contains(clean_ceiling_info, case=False, na=False)]
-                if not matching_rows.empty:
-                    matching_row = matching_rows.iloc[0]
-                    return format_wall_description(category, matching_row)
-
-            return ceiling_info
-
-        except Exception as e:
-            return ceiling_info
-
-    def format_wall_description(category, data_row):
-        """Format wall description with wall-specific columns"""
-        parts = [category]
-
-        wall_system = data_row.get('Revit Type→WALL SYSTEM', '')
-        wall_framing = data_row.get('Revit Type→WALL FRAMING', '')
-        wall_lining = data_row.get('Revit Type→WALL LINING', '')
-
-        if pd.notna(wall_system) and wall_system:
-            parts.append(str(wall_system))
-
-        if pd.notna(wall_framing) and wall_framing:
-            parts.append(str(wall_framing))
-
-        result = ' - '.join(parts)
-
-        if pd.notna(wall_lining) and wall_lining:
-            result += f" with {wall_lining}"
-
-        return result
-
-    # Process all data with priority processing
+    # Process all data with FIXED logic
     processed_data = []
     progress_bar = st.progress(0)
     status_text = st.empty()
+
+    # Show processing examples for first few records
+    show_examples = True
+    example_count = 0
+    max_examples = 3
 
     for index, row in excel_df.iterrows():
         # Update progress
@@ -860,36 +1105,71 @@ def process_passive_fire_schedule(excel_file_content, csv_file_content,
         revizto_id = row.get('ID', '')
         title = row.get('Title', '')
 
-        # Parse service information
+        # Show processing examples for verification
+        if show_examples and example_count < max_examples and title and '|' in title:
+            with st.expander(f"📝 Processing Example {example_count + 1}: {revizto_id}", expanded=False):
+                st.write("**Original Title:**")
+                st.code(title)
+                
+                parts = title.split('|')
+                st.write("**Title Parts:**")
+                for i, part in enumerate(parts):
+                    st.write(f"Part {i+1}: `{part.strip()}`")
+                
+                # Show service parsing logic
+                if len(parts) >= 3:
+                    st.write("**Service Logic:**")
+                    st.write(f"• Discipline from Part 1: `{parts[0].strip()}`")
+                    st.write(f"• Element ID from Part {len(parts)}: `{parts[-1].strip()}`")
+                    
+                    # Show FRR logic
+                    st.write("**FRR Logic:**")
+                    st.write(f"• Item Type extraction from Part 2: `{parts[1].strip()}`")
+                
+                example_count += 1
+
+        # Extract element IDs and string identifiers
+        element_ids = extract_element_ids(title)
+        
+        # FIXED: Parse service information using new logic
         service = parse_service(title, csv_df)
 
-        # Extract element ID for lookups
-        element_id = extract_element_id(title)
-
-        # Get service material with enhanced logic
-        service_material = get_service_material_enhanced(
-            element_id, service, csv_df, materials_lookup_df
+        # Get service material 
+        material = get_service_material_enhanced(
+            element_ids, service, csv_df, 
+            materials_lookup_df, size_lookup_df
         )
 
-        # Get pipe size with enhanced logic
-        pipe_size = get_pipe_size_enhanced(
-            element_id, csv_df, service, size_lookup_df
+        # Get pipe size (returns size and material)
+        size, size_material = get_pipe_size_enhanced(
+            element_ids, csv_df, service, size_lookup_df
         )
 
-        # Extract ceiling/wall info
-        ceiling_info = extract_ceiling_info(title)
+        # Use size lookup material if main material retrieval failed
+        if not material and size_material:
+            material = size_material
 
-        # Get FRR and separating element information
-        frr_info = get_frr_info(ceiling_info, csv_df)
-        separating_element = get_separating_element_enhanced(ceiling_info, csv_df)
+        # Extract ceiling/wall info (middle section from title split by "|")
+        ceiling_info = ''
+        title_parts = title.split('|')
+        if len(title_parts) >= 2:
+            ceiling_info = title_parts[1].strip()
 
+        # FIXED: Get FRR information using new logic
+        frr = get_frr_info(ceiling_info, csv_df, element_ids, confidence_threshold=0.85)
+
+        # Get separating element (just return the middle section)
+        separating_element = get_separating_element_enhanced(ceiling_info, csv_df, element_ids)
+
+        # Compile results
         processed_data.append({
             'Revizto ID': revizto_id,
-            'Service': service,
-            'Service Material': service_material,
-            'Pipe Size(OD)': pipe_size,
-            'FRR': frr_info,
-            'Separating Element': separating_element
+            'Service': service or '',
+            'Service Material': material or '',
+            'Pipe Size(OD)': size or '',
+            'FRR': frr or '',
+            'Separating Element': separating_element or '',
+            'Reference': title
         })
 
     # Clear progress indicators
@@ -899,34 +1179,6 @@ def process_passive_fire_schedule(excel_file_content, csv_file_content,
     # Create final DataFrame
     result_df = pd.DataFrame(processed_data)
 
-    # Second pass: Fill empty cells using lookup tables if available
-    if size_lookup_df is not None or materials_lookup_df is not None:
-        st.info("🔄 Performing second pass to fill empty cells using lookup tables...")
-
-        for index, row in result_df.iterrows():
-            # Fill empty Service Material using materials lookup
-            if materials_lookup_df is not None and (pd.isna(row['Service Material']) or row['Service Material'] == ''):
-                # Try to extract material from Service column
-                service_text = row['Service']
-                if service_text:
-                    material = classify_material_by_keywords(service_text)
-                    if material:
-                        result_df.at[index, 'Service Material'] = material
-
-            # Fill empty Pipe Size using size lookup for structural elements
-            if size_lookup_df is not None and (pd.isna(row['Pipe Size(OD)']) or row['Pipe Size(OD)'] == ''):
-                service_text = row['Service']
-                if service_text and 'Structural' in service_text:
-                    parts = service_text.split('-')
-                    if len(parts) >= 2:
-                        steel_token = parts[1].strip()
-                        steel_name_candidate = re.split(r'[\s,;/\(\)]+', steel_token)[0]
-                        size_str, material = lookup_steel_properties(steel_name_candidate, size_lookup_df)
-                        if size_str:
-                            result_df.at[index, 'Pipe Size(OD)'] = size_str
-                        if material and (pd.isna(row['Service Material']) or row['Service Material'] == ''):
-                            result_df.at[index, 'Service Material'] = material
-
     return result_df
 
 def export_dataframe(df, format_type, filename):
@@ -934,9 +1186,12 @@ def export_dataframe(df, format_type, filename):
 
     if format_type == 'XLSX':
         output = io.BytesIO()
+        
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Passive Fire Schedule', index=False)
             worksheet = writer.sheets['Passive Fire Schedule']
+            
+            # Auto-adjust column widths
             for column in worksheet.columns:
                 max_length = 0
                 column_letter = column[0].column_letter
@@ -965,7 +1220,7 @@ def export_dataframe(df, format_type, filename):
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Passive Fire Schedule</title>
+            <title>Passive Fire Schedule v4.0</title>
             <style>
                 body {{ font-family: Arial, sans-serif; margin: 20px; }}
                 h1 {{ color: #1f77b4; text-align: center; }}
@@ -978,11 +1233,12 @@ def export_dataframe(df, format_type, filename):
             </style>
         </head>
         <body>
-            <h1>Passive Fire Schedule</h1>
+            <h1>Passive Fire Schedule v4.0</h1>
             <div class="summary">
-                <strong>Processing Summary:</strong><br>
+                <strong>Fixed Service & FRR Logic:</strong><br>
                 Total Records: {len(df)}<br>
-                Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+                Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
+                Features: Fixed Service Column & FRR Retrieval Logic
             </div>
             {df.to_html(table_id='passive-fire-table', classes='table table-striped', index=False, escape=False)}
         </body>
@@ -993,8 +1249,34 @@ def main():
     """Main Streamlit application"""
 
     # Header
-    st.markdown('<h1 class="main-header">🔥 Passive Fire Schedule Processor v3.0</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🔥 Passive Fire Schedule Processor v4.0</h1>', unsafe_allow_html=True)
     st.markdown("---")
+
+    # Show fix summary
+    with st.expander("🔧 v4.0 Fixes Applied", expanded=False):
+        st.markdown("""
+        **✅ Issue 1 FIXED - Service Column Generation:**
+        - **NEW**: Extract discipline from **FIRST part** of title (e.g., "HYD" from "ARC (Fyreline) vs HYD")
+        - **NEW**: Extract element ID from **LAST part** of title (e.g., "2570300" from "Pipe Fittings - Standard - 2570300 [173]")
+        - **NEW**: Use element ID to lookup System Classification & Item Type from CSV
+        - **ENHANCED**: If Item Type = "Standard", use Item Name instead (avoid generic values)
+        - **Format**: `{Discipline} - {System Classification} {Item Type/Name}`
+
+        **✅ Issue 2 FIXED - FRR Retrieval:**
+        - **NEW**: Use **SECOND part** of title (e.g., "Ceilings - 53-Clg_(CT10) 16mm Fyreline")
+        - **NEW**: Extract Item Type after first " - " (e.g., "53-Clg_(CT10) 16mm Fyreline")
+        - **NEW**: Search CSV for matching Item_Type (not element ID)
+        - **Fallback**: Element ID lookup if Item Type search fails
+
+        **✅ Issue 3 FIXED - "Standard" Item Type Handling:**
+        - **Problem**: Item Type "Standard" provides no meaningful information
+        - **Solution**: When Item Type = "Standard" → Use Item Name instead
+        - **Example**: "Standard" → "AJ Design-Bend - PVC - Sch 40 - DWV"
+        - **Safety**: Avoids generic Item Names like "Pipe Types"
+
+        **📋 Processing Examples:**
+        The processor will show detailed examples during processing to help verify the logic is working correctly.
+        """)
 
     # Sidebar for configuration
     with st.sidebar:
@@ -1011,26 +1293,9 @@ def main():
         # Output filename
         output_filename = st.text_input(
             "Output Filename",
-            "Passive_Fire_Schedule_Processed",
+            "Passive_Fire_Schedule",
             help="Enter filename (extension will be added automatically)"
         )
-
-        st.markdown("---")
-
-        # Processing options
-        with st.expander("⚙️ Processing Options", expanded=False):
-            st.markdown("""
-            **Material Classification Keywords:**
-            - Steel: 'steel', 'gal', 'fp_gal'
-            - PVC: 'pvc', 'plastic'
-            - PP-R: 'pp-r', 'ppr', 'raufusion'
-            - Copper: 'copper'
-
-            **Size Extraction:**
-            - Automatically extracts largest value
-            - Handles multiple delimiters (-, /, ,)
-            - Preserves diameter symbols (Ø, ø)
-            """)
 
         st.markdown("---")
 
@@ -1047,14 +1312,14 @@ def main():
 
             **Step 3:** Click 'Process Files' button
 
-            **Step 4:** Download your processed schedule
+            **Step 4:** Review processing examples
 
-            **Enhanced Features:**
-            - Automatic second sheet selection for multi-sheet files
-            - Keyword-based material classification
-            - Intelligent size extraction (largest value)
-            - Dual lookup table support
-            - Two-pass processing for data completeness
+            **Step 5:** Download your processed schedule
+
+            **🎯 v4.0 FIXES:**
+            - **Service Column**: Now uses first part for discipline, last part for element ID lookup
+            - **FRR Retrieval**: Now uses second part Item Type search, not element ID
+            - **Processing Examples**: Shows detailed parsing logic for verification
             """)
 
     # Main content area - Required files
@@ -1074,7 +1339,7 @@ def main():
         )
 
         if excel_file:
-            st.success(f"✔ Excel file loaded: {excel_file.name}")
+            st.success(f"✅ Excel file loaded: {excel_file.name}")
             st.info(f"File size: {excel_file.size / 1024:.1f} KB")
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1087,16 +1352,16 @@ def main():
             "Choose CSV file",
             type=['csv'],
             key="csv_upload",
-            help="Upload CSV file with component data"
+            help="Upload CSV file with component data - column names will be auto-standardized by position"
         )
 
         if csv_file:
-            st.success(f"✔ CSV file loaded: {csv_file.name}")
+            st.success(f"✅ CSV file loaded: {csv_file.name}")
             st.info(f"File size: {csv_file.size / 1024:.1f} KB")
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Optional lookup tables section
-    st.subheader("📁 Optional Lookup Tables")
+    st.subheader("🔍 Optional Lookup Tables")
 
     # Create two columns for the lookup tables
     col1, col2 = st.columns(2)
@@ -1114,21 +1379,8 @@ def main():
         )
 
         if size_lookup_file:
-            st.success(f"✔ Size lookup: {size_lookup_file.name}")
+            st.success(f"✅ Size lookup: {size_lookup_file.name}")
             size_lookup_type = 'csv' if size_lookup_file.name.endswith('.csv') else 'excel'
-
-            with st.expander("ℹ️ Size Lookup Info", expanded=False):
-                st.markdown("""
-                **Expected columns:**
-                - Steel Name / Item Name
-                - Overall Width / Width
-                - Overall Height / Height
-                - Material / Type
-
-                **Usage:**
-                - Structural items: "410UB60" → "410x60"
-                - Includes material properties
-                """)
         else:
             size_lookup_type = None
             st.info("No size lookup table uploaded")
@@ -1148,21 +1400,8 @@ def main():
         )
 
         if materials_lookup_file:
-            st.success(f"✔ Materials lookup: {materials_lookup_file.name}")
+            st.success(f"✅ Materials lookup: {materials_lookup_file.name}")
             materials_lookup_type = 'csv' if materials_lookup_file.name.endswith('.csv') else 'excel'
-
-            with st.expander("ℹ️ Materials Lookup Info", expanded=False):
-                st.markdown("""
-                **Expected columns:**
-                - Material Name / Source Material
-                - Mapped Material / Target Material
-
-                **Mapping examples:**
-                - Plastic → PVC
-                - RAUFUSION → PP-R
-                - FP_GAL → Steel
-                - GAL → Steel
-                """)
         else:
             materials_lookup_type = None
             st.info("No materials lookup table uploaded")
@@ -1174,7 +1413,7 @@ def main():
         st.markdown("---")
 
         if st.button("🚀 Process Files", type="primary", use_container_width=True):
-            with st.spinner("Processing your files... This may take a few minutes."):
+            with st.spinner("Processing your files with FIXED v4.0 Service & FRR logic..."):
                 try:
                     # Prepare lookup table data
                     size_lookup_content = None
@@ -1197,7 +1436,7 @@ def main():
 
                     if result_df is not None:
                         st.balloons()
-                        st.success("🎉 Processing completed successfully!")
+                        st.success("🎉 Processing completed successfully with FIXED logic!")
 
                         # Display statistics
                         col1, col2, col3, col4 = st.columns(4)
@@ -1217,56 +1456,13 @@ def main():
                             lookup_count = sum([1 for f in [size_lookup_file, materials_lookup_file] if f])
                             st.metric("Lookup Tables", lookup_count, "Used" if lookup_count > 0 else "None")
 
-                        # Additional statistics
-                        st.markdown('<div class="metrics-container">', unsafe_allow_html=True)
-                        col1, col2, col3, col4 = st.columns(4)
-
-                        with col1:
-                            material_count = len(result_df[result_df['Service Material'].str.len() > 0])
-                            st.metric("Material Data", material_count, f"{material_count/len(result_df)*100:.1f}%")
-
-                        with col2:
-                            pipe_count = len(result_df[result_df['Pipe Size(OD)'].str.len() > 0])
-                            st.metric("Pipe Size Data", pipe_count, f"{pipe_count/len(result_df)*100:.1f}%")
-
-                        with col3:
-                            separating_count = len(result_df[result_df['Separating Element'].str.len() > 0])
-                            st.metric("Separating Elements", separating_count, f"{separating_count/len(result_df)*100:.1f}%")
-
-                        with col4:
-                            warning_count = len(result_df[result_df['FRR'].str.contains('WARNING', na=False)])
-                            if warning_count > 0:
-                                st.metric("⚠️ Warnings", warning_count, "Review Required")
-                            else:
-                                st.metric("✅ No Warnings", 0, "All Clear")
-
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-#                        # Comment out material distribution for now
-#                        material_counts = result_df['Service Material'].value_counts()
-#                        if not material_counts.empty:
-#                            st.subheader("🔧 Material Distribution")
-#                            material_df = pd.DataFrame({
-#                                'Material': material_counts.index,
-#                                'Count': material_counts.values,
-#                                'Percentage': (material_counts.values / len(result_df) * 100).round(1)
-#                            })
-#                            st.bar_chart(material_df.set_index('Material')['Count'])
-
-                        # ✅ New: Size Distribution
-                        size_counts = result_df['Pipe Size(OD)'].value_counts()
-                        if not size_counts.empty:
-                            st.subheader("📏 Size Distribution")
-                            size_df = pd.DataFrame({
-                                'Size': size_counts.index,
-                                'Count': size_counts.values,
-                                'Percentage': (size_counts.values / len(result_df) * 100).round(1)
-                            })
-                            st.bar_chart(size_df.set_index('Size')['Count'])
-
+                        # Show sample results to verify fixes
+                        st.subheader("🔍 Sample Results (First 5 Records)")
+                        sample_df = result_df.head(5)[['Revizto ID', 'Service', 'FRR', 'Separating Element']]
+                        st.dataframe(sample_df, use_container_width=True)
 
                         # Data preview
-                        st.subheader("🔍 Data Preview")
+                        st.subheader("📊 Full Data Preview")
                         st.dataframe(
                             result_df.head(10),
                             use_container_width=True,
@@ -1293,15 +1489,6 @@ def main():
                         except Exception as e:
                             st.error(f"Error preparing download: {e}")
 
-                        # Warnings section
-                        if warning_count > 0:
-                            st.markdown('<div class="warning-box">', unsafe_allow_html=True)
-                            st.subheader("⚠️ Review Required")
-                            warning_records = result_df[result_df['FRR'].str.contains('WARNING', na=False)]
-                            st.dataframe(warning_records[['Revizto ID', 'FRR']], use_container_width=True)
-                            st.markdown("These records have conflicting FRR values and require manual review.")
-                            st.markdown('</div>', unsafe_allow_html=True)
-
                     else:
                         st.error("❌ Processing failed. Please check your files and try again.")
 
@@ -1316,7 +1503,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: #666; margin-top: 2rem;'>"
-        "🔥 Passive Fire Schedule Processor v3.0 | Enhanced with Dual Lookup Tables & Smart Processing"
+        "🔥 Passive Fire Schedule Processor v4.0"
         "</div>",
         unsafe_allow_html=True
     )
