@@ -1,4 +1,3 @@
-# passive_fire_processor_v4.0.py - Fixed Service & FRR Logic
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,10 +9,12 @@ import io
 import base64
 from typing import List, Dict, Tuple, Optional, Union
 from difflib import SequenceMatcher
+import plotly.express as px
+import plotly.graph_objects as go
 
 # Set page configuration
 st.set_page_config(
-    page_title="Passive Fire Schedule Processor v4.0",
+    page_title="Passive Fire Schedule Processor v4.3",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -652,6 +653,66 @@ def lookup_material_mapping(material_text, materials_lookup_df):
 
     return ''
 
+def standardize_materials_with_lookup(result_df, materials_lookup_df):
+    """
+    NEW v4.3: Final material standardization step using Materials Lookup table
+    
+    This function takes the populated Material column and cross-references
+    each material with the Materials Lookup table to simplify/standardize the output.
+    """
+    if materials_lookup_df is None or result_df is None:
+        return result_df
+    
+    try:
+        standardized_materials = []
+        material_mapping_stats = {'mapped': 0, 'unmapped': 0, 'empty': 0}
+        
+        for index, row in result_df.iterrows():
+            original_material = str(row.get('Material', '')).strip()
+            
+            if not original_material:
+                standardized_materials.append('')
+                material_mapping_stats['empty'] += 1
+                continue
+            
+            # Try to find a mapping in the Materials Lookup table
+            mapped_material = lookup_material_mapping(original_material, materials_lookup_df)
+            
+            if mapped_material and mapped_material != original_material:
+                standardized_materials.append(mapped_material)
+                material_mapping_stats['mapped'] += 1
+            else:
+                # Keep original if no mapping found
+                standardized_materials.append(original_material)
+                material_mapping_stats['unmapped'] += 1
+        
+        # Update the DataFrame
+        result_df['Material'] = standardized_materials
+        
+        # Report the standardization results
+        total_processed = len(result_df)
+        st.success(f"✅ Final material standardization completed!")
+        
+        with st.expander("📊 Material Standardization Report", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Mapped Materials", material_mapping_stats['mapped'], 
+                         f"{(material_mapping_stats['mapped']/total_processed*100):.1f}%")
+            with col2:
+                st.metric("Unchanged Materials", material_mapping_stats['unmapped'],
+                         f"{(material_mapping_stats['unmapped']/total_processed*100):.1f}%")
+            with col3:
+                st.metric("Empty Materials", material_mapping_stats['empty'],
+                         f"{(material_mapping_stats['empty']/total_processed*100):.1f}%")
+            
+            st.info("💡 This final step standardizes materials using the Materials Lookup table for consistent output.")
+        
+        return result_df
+        
+    except Exception as e:
+        st.warning(f"Error in final material standardization: {e}")
+        return result_df
+
 # ============================
 # FIXED SERVICE PARSING - Issue 1 Fix
 # ============================
@@ -861,20 +922,20 @@ def get_frr_info(ceiling_info, csv_data, element_ids=None, confidence_threshold=
 
 def get_service_material_enhanced(element_ids, service_text, csv_data, 
                                  materials_lookup=None, size_lookup=None):
-    """Enhanced service material retrieval with multiple sources"""
+    """
+    UPDATED: Material retrieval with CSV-first priority
     
-    # Priority 1: Keyword detection on service text
-    keyword_material = classify_material_by_keywords(service_text)
-    if keyword_material:
-        return keyword_material
-
+    Priority 1: CSV Material Columns (Mechanical_Material & Structural_Material)
+    Priority 2: Keyword Detection on Service Text (fallback only)
+    """
+    
     if not element_ids:
         return ''
 
     # Extract string identifiers from element_ids
     string_identifiers = [str(eid) for eid in element_ids if isinstance(eid, str)]
 
-    # Priority 2: CSV mechanical material lookup
+    # Priority 1A: CSV mechanical material lookup
     mechanical_material = unified_data_retrieval(
         csv_data, element_ids, string_identifiers,
         [COLUMN_MAPPING.csv_mechanical_material],
@@ -882,20 +943,16 @@ def get_service_material_enhanced(element_ids, service_text, csv_data,
     )
 
     if mechanical_material:
-        # Apply keyword classification to CSV result
-        classified = classify_material_by_keywords(mechanical_material)
-        if classified:
-            return classified
-        
-        # Try materials lookup on CSV result
+        # Try materials lookup table mapping first
         if materials_lookup is not None:
             lookup_result = lookup_material_mapping(mechanical_material, materials_lookup)
             if lookup_result:
                 return lookup_result
         
+        # If no mapping found, return full value as-is
         return mechanical_material
 
-    # Priority 3: CSV structural material lookup  
+    # Priority 1B: CSV structural material lookup  
     structural_material = unified_data_retrieval(
         csv_data, element_ids, string_identifiers,
         [COLUMN_MAPPING.csv_structural_material],
@@ -903,31 +960,30 @@ def get_service_material_enhanced(element_ids, service_text, csv_data,
     )
 
     if structural_material:
-        classified = classify_material_by_keywords(structural_material)
-        if classified:
-            return classified
-        
+        # Try materials lookup table mapping first
         if materials_lookup is not None:
             lookup_result = lookup_material_mapping(structural_material, materials_lookup)
             if lookup_result:
                 return lookup_result
         
+        # If no mapping found, return full value as-is
         return structural_material
 
-    # Priority 4: Size lookup table material (for structural elements)
+    # Priority 2: Keyword detection on service text (FALLBACK ONLY - when no CSV material data)
+    keyword_material = classify_material_by_keywords(service_text)
+    if keyword_material:
+        return keyword_material
+
+    # Priority 3: Size lookup table material (for structural elements - as additional fallback)
     if size_lookup is not None and service_text and 'Structural' in service_text:
-        # Extract steel name from service text - ENHANCED extraction
+        # Extract steel name from service text
         parts = service_text.split('-')
         if len(parts) >= 2:
-            # Get the part after "Structural -" and clean it up
             steel_part = parts[1].strip()
-            
-            # Try to extract steel name - could be "200 DHS Purlin", "410UB60", etc.
             steel_name = steel_part.split()[0] if steel_part.split() else steel_part
             
-            # For cases like "200 DHS Purlin", we want the full "200 DHS Purlin" or "200 DHS"
+            # For cases like "200 DHS Purlin", get the full description
             if 'DHS' in steel_part.upper():
-                # Extract the full DHS description
                 dhs_match = re.search(r'(\d+\s*DHS(?:\s*Purlin)?)', steel_part, re.IGNORECASE)
                 if dhs_match:
                     steel_name = dhs_match.group(1).strip()
@@ -1004,6 +1060,89 @@ def get_separating_element_enhanced(ceiling_info, csv_data, element_ids=None):
 
     except Exception as e:
         return ceiling_info  # Fallback to original
+
+# ============================
+# DATA VISUALIZATION FUNCTIONS
+# ============================
+
+def create_frr_distribution(df):
+    """Create FRR distribution visualization"""
+    if df is None or df.empty:
+        return None, None
+    
+    # Filter out empty FRR values
+    frr_data = df[df['FRR'].str.len() > 0]['FRR'].copy()
+    
+    if frr_data.empty:
+        return None, None
+    
+    # Get value counts
+    frr_counts = frr_data.value_counts().sort_index()
+    
+    # Create table
+    frr_table = pd.DataFrame({
+        'FRR Rating': frr_counts.index,
+        'Count': frr_counts.values,
+        'Percentage': (frr_counts.values / len(frr_data) * 100).round(1)
+    })
+    
+    # Create bar chart
+    fig = px.bar(
+        frr_table, 
+        x='FRR Rating', 
+        y='Count',
+        labels={'Count': 'Number of Records'},
+        text='Count'
+    )
+    
+    fig.update_traces(textposition='outside')
+    fig.update_layout(
+        showlegend=False,
+        height=400,
+        yaxis_title='Count'
+    )
+    
+    return frr_table, fig
+
+def create_material_distribution(df):
+    """Create Material distribution visualization"""
+    if df is None or df.empty:
+        return None, None
+    
+    # Filter out empty material values
+    material_data = df[df['Material'].str.len() > 0]['Material'].copy()
+    
+    if material_data.empty:
+        return None, None
+    
+    # Get value counts
+    material_counts = material_data.value_counts()
+    
+    # Create table
+    material_table = pd.DataFrame({
+        'Material': material_counts.index,
+        'Count': material_counts.values,
+        'Percentage': (material_counts.values / len(material_data) * 100).round(1)
+    })
+    
+    # Create bar chart
+    fig = px.bar(
+        material_table, 
+        x='Material', 
+        y='Count',
+        labels={'Count': 'Number of Records'},
+        text='Count'
+    )
+    
+    fig.update_traces(textposition='outside')
+    fig.update_layout(
+        showlegend=False,
+        height=400,
+        yaxis_title='Count',
+        xaxis={'categoryorder': 'total descending'}
+    )
+    
+    return material_table, fig
 
 # ============================
 # UTILITY FUNCTIONS
@@ -1134,7 +1273,7 @@ def process_passive_fire_schedule(excel_file_content, csv_file_content,
         # FIXED: Parse service information using new logic
         service = parse_service(title, csv_df)
 
-        # Get service material 
+        # Get Material 
         material = get_service_material_enhanced(
             element_ids, service, csv_df, 
             materials_lookup_df, size_lookup_df
@@ -1165,8 +1304,8 @@ def process_passive_fire_schedule(excel_file_content, csv_file_content,
         processed_data.append({
             'Revizto ID': revizto_id,
             'Service': service or '',
-            'Service Material': material or '',
-            'Pipe Size(OD)': size or '',
+            'Material': material or '',
+            'Size': size or '',
             'FRR': frr or '',
             'Separating Element': separating_element or '',
             'Reference': title
@@ -1178,6 +1317,10 @@ def process_passive_fire_schedule(excel_file_content, csv_file_content,
 
     # Create final DataFrame
     result_df = pd.DataFrame(processed_data)
+
+    # NEW v4.3: Apply final material standardization using Materials Lookup table
+    if materials_lookup_df is not None:
+        result_df = standardize_materials_with_lookup(result_df, materials_lookup_df)
 
     return result_df
 
@@ -1220,7 +1363,7 @@ def export_dataframe(df, format_type, filename):
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Passive Fire Schedule v4.0</title>
+            <title>Passive Fire Schedule v4.2</title>
             <style>
                 body {{ font-family: Arial, sans-serif; margin: 20px; }}
                 h1 {{ color: #1f77b4; text-align: center; }}
@@ -1233,12 +1376,12 @@ def export_dataframe(df, format_type, filename):
             </style>
         </head>
         <body>
-            <h1>Passive Fire Schedule v4.0</h1>
+            <h1>Passive Fire Schedule v4.2</h1>
             <div class="summary">
-                <strong>Fixed Service & FRR Logic:</strong><br>
+                <strong>Enhanced Data Visualization:</strong><br>
                 Total Records: {len(df)}<br>
                 Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}<br>
-                Features: Fixed Service Column & FRR Retrieval Logic
+                Features: FRR & Material Distribution Analysis
             </div>
             {df.to_html(table_id='passive-fire-table', classes='table table-striped', index=False, escape=False)}
         </body>
@@ -1249,33 +1392,35 @@ def main():
     """Main Streamlit application"""
 
     # Header
-    st.markdown('<h1 class="main-header">🔥 Passive Fire Schedule Processor v4.0</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🔥 Passive Fire Schedule Processor v4.3</h1>', unsafe_allow_html=True)
+    st.markdown("**🔧 ENHANCED: Final Material Standardization with Materials Lookup Cross-Check**")
     st.markdown("---")
 
-    # Show fix summary
-    with st.expander("🔧 v4.0 Fixes Applied", expanded=False):
+    # Show updates summary
+    with st.expander("🔧 v4.3 Enhancements", expanded=False):
         st.markdown("""
-        **✅ Issue 1 FIXED - Service Column Generation:**
-        - **NEW**: Extract discipline from **FIRST part** of title (e.g., "HYD" from "ARC (Fyreline) vs HYD")
-        - **NEW**: Extract element ID from **LAST part** of title (e.g., "2570300" from "Pipe Fittings - Standard - 2570300 [173]")
-        - **NEW**: Use element ID to lookup System Classification & Item Type from CSV
-        - **ENHANCED**: If Item Type = "Standard", use Item Name instead (avoid generic values)
-        - **Format**: `{Discipline} - {System Classification} {Item Type/Name}`
+        **✅ Final Material Standardization (NEW):**
+        - **NEW**: Additional cross-check step after initial material population
+        - **NEW**: Uses Materials Lookup table to standardize/simplify material names
+        - **NEW**: Statistical reporting of mapping success rates
+        - **IMPROVED**: Cleaner, more consistent material output
 
-        **✅ Issue 2 FIXED - FRR Retrieval:**
-        - **NEW**: Use **SECOND part** of title (e.g., "Ceilings - 53-Clg_(CT10) 16mm Fyreline")
-        - **NEW**: Extract Item Type after first " - " (e.g., "53-Clg_(CT10) 16mm Fyreline")
-        - **NEW**: Search CSV for matching Item_Type (not element ID)
-        - **Fallback**: Element ID lookup if Item Type search fails
+        **🔄 Material Processing Flow:**
+        1. **Initial Population**: Get materials from CSV and Steel Lookup tables
+        2. **Final Standardization**: Cross-reference with Materials Lookup table
+        3. **Simplification**: Convert complex material names to standard terms
+        4. **Reporting**: Show mapping statistics and success rates
 
-        **✅ Issue 3 FIXED - "Standard" Item Type Handling:**
-        - **Problem**: Item Type "Standard" provides no meaningful information
-        - **Solution**: When Item Type = "Standard" → Use Item Name instead
-        - **Example**: "Standard" → "AJ Design-Bend - PVC - Sch 40 - DWV"
-        - **Safety**: Avoids generic Item Names like "Pipe Types"
+        **📊 Previous Features (v4.2) Still Active:**
+        - FRR Distribution table and bar chart
+        - Material Distribution table and bar chart
+        - Interactive visualizations with Plotly
+        - Statistical summary with counts and percentages
 
-        **📋 Processing Examples:**
-        The processor will show detailed examples during processing to help verify the logic is working correctly.
+        **🎯 Core Logic (v4.1) Still Active:**
+        - Service column generation with discipline and element ID lookup
+        - FRR retrieval using Item Type from second title part
+        - Enhanced "Standard" Item Type handling
         """)
 
     # Sidebar for configuration
@@ -1312,14 +1457,14 @@ def main():
 
             **Step 3:** Click 'Process Files' button
 
-            **Step 4:** Review processing examples
+            **Step 4:** Review processing examples & distributions
 
             **Step 5:** Download your processed schedule
 
-            **🎯 v4.0 FIXES:**
-            - **Service Column**: Now uses first part for discipline, last part for element ID lookup
-            - **FRR Retrieval**: Now uses second part Item Type search, not element ID
-            - **Processing Examples**: Shows detailed parsing logic for verification
+            **🔧 v4.3 NEW FEATURES:**
+            - **Final Material Standardization**: Extra cross-check with Materials Lookup
+            - **Simplified Output**: Cleaner, more consistent material names
+            - **Mapping Statistics**: See how many materials were standardized
             """)
 
     # Main content area - Required files
@@ -1390,13 +1535,13 @@ def main():
     with col2:
         st.markdown('<div class="lookup-section">', unsafe_allow_html=True)
         st.markdown("### 🔧 Materials Lookup Table")
-        st.markdown("*For material classification mapping*")
+        st.markdown("*For material classification mapping & final standardization*")
 
         materials_lookup_file = st.file_uploader(
             "Choose materials lookup file",
             type=['csv', 'xlsx', 'xls'],
             key="materials_lookup_upload",
-            help="Upload CSV or Excel file with material mappings"
+            help="Upload CSV or Excel file with material mappings - used for final standardization step"
         )
 
         if materials_lookup_file:
@@ -1404,7 +1549,7 @@ def main():
             materials_lookup_type = 'csv' if materials_lookup_file.name.endswith('.csv') else 'excel'
         else:
             materials_lookup_type = None
-            st.info("No materials lookup table uploaded")
+            st.info("No materials lookup table uploaded - final standardization will be skipped")
 
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1413,7 +1558,7 @@ def main():
         st.markdown("---")
 
         if st.button("🚀 Process Files", type="primary", use_container_width=True):
-            with st.spinner("Processing your files with FIXED v4.0 Service & FRR logic..."):
+            with st.spinner("Processing your files..."):
                 try:
                     # Prepare lookup table data
                     size_lookup_content = None
@@ -1436,7 +1581,7 @@ def main():
 
                     if result_df is not None:
                         st.balloons()
-                        st.success("🎉 Processing completed successfully with FIXED logic!")
+                        st.success("🎉 Processing completed successfully!")
 
                         # Display statistics
                         col1, col2, col3, col4 = st.columns(4)
@@ -1456,15 +1601,40 @@ def main():
                             lookup_count = sum([1 for f in [size_lookup_file, materials_lookup_file] if f])
                             st.metric("Lookup Tables", lookup_count, "Used" if lookup_count > 0 else "None")
 
-                        # Show sample results to verify fixes
-                        st.subheader("🔍 Sample Results (First 5 Records)")
-                        sample_df = result_df.head(5)[['Revizto ID', 'Service', 'FRR', 'Separating Element']]
-                        st.dataframe(sample_df, use_container_width=True)
+                        # NEW: FRR Distribution Analysis
+                        st.subheader("🔥 FRR Distribution Analysis")
+                        frr_table, frr_chart = create_frr_distribution(result_df)
+                        
+                        if frr_table is not None and frr_chart is not None:
+                            col1, col2 = st.columns([1, 2])
+                            with col1:
+                                st.write("**FRR Summary Table:**")
+                                st.dataframe(frr_table, use_container_width=True)
+                            with col2:
+                                st.write("**FRR Distribution:**")
+                                st.plotly_chart(frr_chart, use_container_width=True)
+                        else:
+                            st.info("No FRR data available for distribution analysis")
+
+                        # NEW: Material Distribution Analysis
+                        st.subheader("🔧 Material Distribution Analysis")
+                        material_table, material_chart = create_material_distribution(result_df)
+                        
+                        if material_table is not None and material_chart is not None:
+                            col1, col2 = st.columns([1, 2])
+                            with col1:
+                                st.write("**Material Summary Table:**")
+                                st.dataframe(material_table, use_container_width=True)
+                            with col2:
+                                st.write("**Material Distribution:**")
+                                st.plotly_chart(material_chart, use_container_width=True)
+                        else:
+                            st.info("No material data available for distribution analysis")
 
                         # Data preview
                         st.subheader("📊 Full Data Preview")
                         st.dataframe(
-                            result_df.head(10),
+                            result_df.head(20),
                             use_container_width=True,
                             height=400
                         )
@@ -1503,7 +1673,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: #666; margin-top: 2rem;'>"
-        "🔥 Passive Fire Schedule Processor v4.0"
+        "🔥 Passive Fire Schedule Processor v4.3"
         "</div>",
         unsafe_allow_html=True
     )
