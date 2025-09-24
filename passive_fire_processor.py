@@ -1557,7 +1557,7 @@ def main():
     if excel_file and csv_file:
         st.markdown("---")
 
-        if st.button("🚀 Process Files", type="primary", use_container_width=True):
+        if st.button("🚀 Process Files", type="primary", width="stretch"):
             with st.spinner("Processing your files..."):
                 try:
                     # Prepare lookup table data
@@ -1609,10 +1609,10 @@ def main():
                             col1, col2 = st.columns([1, 2])
                             with col1:
                                 st.write("**FRR Summary Table:**")
-                                st.dataframe(frr_table, use_container_width=True)
+                                st.dataframe(frr_table, width="stretch")
                             with col2:
                                 st.write("**FRR Distribution:**")
-                                st.plotly_chart(frr_chart, use_container_width=True)
+                                st.plotly_chart(frr_chart, width="stretch")
                         else:
                             st.info("No FRR data available for distribution analysis")
 
@@ -1624,10 +1624,10 @@ def main():
                             col1, col2 = st.columns([1, 2])
                             with col1:
                                 st.write("**Material Summary Table:**")
-                                st.dataframe(material_table, use_container_width=True)
+                                st.dataframe(material_table, width="stretch")
                             with col2:
                                 st.write("**Material Distribution:**")
-                                st.plotly_chart(material_chart, use_container_width=True)
+                                st.plotly_chart(material_chart, width="stretch")
                         else:
                             st.info("No material data available for distribution analysis")
 
@@ -1635,7 +1635,7 @@ def main():
                         st.subheader("📊 Full Data Preview")
                         st.dataframe(
                             result_df.head(20),
-                            use_container_width=True,
+                            width="stretch",
                             height=400
                         )
 
@@ -1651,7 +1651,7 @@ def main():
                                 file_name=filename,
                                 mime=mime_type,
                                 type="primary",
-                                use_container_width=True
+                                width="stretch"
                             )
 
                             st.success(f"Ready to download: {filename}")
